@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
 	karmadapolicyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1" // Import cho FederatedResourceQuota
 	appsv1 "k8s.io/api/apps/v1"                                                    // Import cho Deployment API
 	"k8s.io/apimachinery/pkg/runtime"
@@ -57,8 +58,41 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// In ra thông tin về tên và namespace của Deployment
-	log.Info("Reconciling Deployment", "Deployment Name", deployment.Name, "Namespace", deployment.Namespace)
+	// Lấy thông tin yêu cầu CPU và Memory của các container trong Deployment
+	container := deployment.Spec.Template.Spec.Containers[0]
+
+	// Lấy CPU request
+	cpuRequest := "0"
+	if container.Resources.Requests.Cpu() != nil {
+		cpuRequest = container.Resources.Requests.Cpu().String()
+	}
+
+	// Lấy Memory request
+	memoryRequest := "0"
+	if container.Resources.Requests.Memory() != nil {
+		memoryRequest = container.Resources.Requests.Memory().String()
+	}
+
+	// Chuẩn bị cấu trúc JSON để chứa thông tin Deployment
+	deploymentInfo := map[string]interface{}{
+		"Deployment Name": deployment.Name,
+		"Namespace":       deployment.Namespace,
+		"Container": map[string]string{
+			"Container Name": container.Name,
+			"CPU Request":    cpuRequest,
+			"Memory Request": memoryRequest,
+		},
+	}
+
+	// Chuyển đổi cấu trúc dữ liệu thành JSON và in ra
+	jsonResult, err := json.MarshalIndent(deploymentInfo, "", "  ")
+	if err != nil {
+		log.Error(err, "unable to marshal DeploymentInfo to JSON")
+		return ctrl.Result{}, err
+	}
+
+	// In kết quả JSON
+	fmt.Printf("Deployment Info: %s\n", string(jsonResult))
 
 	// Gọi hàm để in ra thông tin ResourceQuota của Deployment
 	if err := printFederatedResourceQuota(ctx, deployment, r.Client); err != nil {
