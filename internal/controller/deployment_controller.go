@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	karmadapolicyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1" // Import cho FederatedResourceQuota
 	appsv1 "k8s.io/api/apps/v1"                                                    // Import cho Deployment API
 	"k8s.io/apimachinery/pkg/runtime"
@@ -91,19 +93,36 @@ func printFederatedResourceQuota(ctx context.Context, deployment appsv1.Deployme
 
 	// Duyệt qua tất cả các FederatedResourceQuota trong namespace của Deployment
 	for _, frq := range federatedResourceQuotaList.Items {
-		log.Info("Federated ResourceQuota", "name", frq.Name, "namespace", frq.Namespace)
-
-		// In thông tin tổng thể
-		log.Info("Overall Quota", "CPU", frq.Spec.Overall.Cpu, "Used CPU", frq.Status.OverallUsed.Cpu)
-
-		// In thông tin chi tiết về staticAssignments và aggregatedStatus
-		for _, assignment := range frq.Spec.StaticAssignments {
-			log.Info("Cluster Assignment", "Cluster Name", assignment.ClusterName, "Hard CPU", assignment.Hard["cpu"])
+		// Tạo cấu trúc dữ liệu JSON dễ đọc
+		result := map[string]interface{}{
+			"name":          frq.Name,
+			"namespace":     frq.Namespace,
+			"clusterStatus": []map[string]string{},
 		}
 
+		// Thêm các thông tin aggregatedStatus
 		for _, status := range frq.Status.AggregatedStatus {
-			log.Info("Cluster Usage", "Cluster Name", status.ClusterName, "Hard CPU", status.Hard["cpu"], "Used CPU", status.Used["cpu"])
+			hardCpu := status.Hard["cpu"]
+			usedCpu := status.Used["cpu"]
+			hardMemory := status.Hard["memory"] // Lấy giá trị memory từ phần Hard
+			usedMemory := status.Used["memory"] // Lấy giá trị memory từ phần Used
+			result["clusterStatus"] = append(result["clusterStatus"].([]map[string]string), map[string]string{
+				"Cluster Name": status.ClusterName,
+				"Hard CPU":     hardCpu.String(),
+				"Used CPU":     usedCpu.String(),
+				"Hard Memory":  hardMemory.String(), // Thêm thông tin về memory
+				"Used Memory":  usedMemory.String(), // Thêm thông tin về memory đã sử dụng
+			})
 		}
+
+		// In kết quả dưới dạng JSON thụt lề
+		jsonResult, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			log.Error(err, "unable to marshal FederatedResourceQuota to JSON")
+			return err
+		}
+
+		fmt.Printf("Federated ResourceQuota Details: %s\n", string(jsonResult))
 	}
 	return nil
 }
