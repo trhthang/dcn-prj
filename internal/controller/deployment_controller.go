@@ -77,10 +77,12 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	fmt.Printf("Cluster Quota Info: %s\n", clusterQuotaInfo)
 
-	if err := adjustQuotaBasedOnDeployment(ctx, deployment, r.Client); err != nil {
-		log.Error(err, "unable to adjust and update cluster quota based on deployment")
-		return ctrl.Result{}, err
+	log.Info("Starting quota adjustment")
+	err = adjustQuotaBasedOnDeployment(ctx, deployment, r.Client)
+	if err != nil {
+		log.Error(err, "Failed to adjust quota")
 	}
+	log.Info("Finished quota adjustment")
 
 	return ctrl.Result{}, nil
 }
@@ -205,14 +207,52 @@ func adjustQuotaBasedOnDeployment(ctx context.Context, deployment appsv1.Deploym
 			hardCpu := assignment.Hard[corev1.ResourceCPU]
 			hardMemory := assignment.Hard[corev1.ResourceMemory]
 
-			// So sánh yêu cầu CPU và Memory của Deployment với quota hiện tại
-			if cpuRequest.Cmp(hardCpu) > 0 || memoryRequest.Cmp(hardMemory) > 0 {
-				// Điều chỉnh quota tài nguyên cho cluster này
-				frq.Spec.StaticAssignments[i].Hard[corev1.ResourceCPU] = resource.MustParse(cpuRequest.String())
-				frq.Spec.StaticAssignments[i].Hard[corev1.ResourceMemory] = resource.MustParse(memoryRequest.String())
+			// Tìm thông tin tài nguyên đã sử dụng từ AggregatedStatus
+			var usedCpu, usedMemory resource.Quantity
+			for _, status := range frq.Status.AggregatedStatus {
+				if status.ClusterName == assignment.ClusterName {
+					usedCpu = status.Used[corev1.ResourceCPU]
+					usedMemory = status.Used[corev1.ResourceMemory]
+					break
+				}
+			}
 
-				log.Info("Adjusted FederatedResourceQuota for cluster", "cluster", assignment.ClusterName, "new CPU request", cpuRequest.String(), "new Memory request", memoryRequest.String())
+			// Tính toán tài nguyên khả dụng
+			availableCpu := hardCpu.DeepCopy()
+			availableCpu.Sub(usedCpu)
+			availableMemory := hardMemory.DeepCopy()
+			availableMemory.Sub(usedMemory)
 
+			// Điều chỉnh quota CPU nếu không đủ
+			// Điều chỉnh quota CPU nếu không đủ
+			if cpuRequest.Cmp(availableCpu) > 0 {
+				// Tính toán phần thiếu CPU
+				cpuDeficit := cpuRequest.DeepCopy()
+				cpuDeficit.Sub(availableCpu)
+
+				// Tăng hard resource để bù vào phần thiếu
+				newCpuLimit := hardCpu.DeepCopy()
+				newCpuLimit.Add(cpuDeficit)
+
+				frq.Spec.StaticAssignments[i].Hard[corev1.ResourceCPU] = newCpuLimit
+
+				log.Info("Adjusted CPU FederatedResourceQuota for cluster", "cluster", assignment.ClusterName, "new CPU limit", newCpuLimit.String(), "CPU deficit", cpuDeficit.String())
+				quotaUpdated = true
+			}
+
+			// Điều chỉnh quota Memory nếu không đủ
+			if memoryRequest.Cmp(availableMemory) > 0 {
+				// Tính toán phần thiếu Memory
+				memoryDeficit := memoryRequest.DeepCopy()
+				memoryDeficit.Sub(availableMemory)
+
+				// Tăng hard resource để bù vào phần thiếu
+				newMemoryLimit := hardMemory.DeepCopy()
+				newMemoryLimit.Add(memoryDeficit)
+
+				frq.Spec.StaticAssignments[i].Hard[corev1.ResourceMemory] = newMemoryLimit
+
+				log.Info("Adjusted Memory FederatedResourceQuota for cluster", "cluster", assignment.ClusterName, "new Memory limit", newMemoryLimit.String(), "Memory deficit", memoryDeficit.String())
 				quotaUpdated = true
 			}
 		}
