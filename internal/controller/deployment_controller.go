@@ -17,13 +17,12 @@ limitations under the License.
 package controller
 
 import (
-	corev1 "k8s.io/api/core/v1"
-
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
-	karmadapolicyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1" // Import cho FederatedResourceQuota
+	karmadapolicyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1" // Import cho PropagationPolicy
 	appsv1 "k8s.io/api/apps/v1"                                                    // Import cho Deployment API
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -38,19 +37,11 @@ type DeploymentReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=resourcequotascaling.trhthang.com,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=resourcequotascaling.trhthang.com,resources=deployments/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=resourcequotascaling.trhthang.com,resources=deployments/finalizers,verbs=update
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=policy.karmada.io,resources=propagationpolicies,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Deployment object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.0/pkg/reconcile
 func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
@@ -69,31 +60,48 @@ func (r *DeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	fmt.Printf("Deployment Info: %s\n", deploymentInfo)
 
-	// Gọi hàm để lấy thông tin Resource Quota của từng Cluster và in ra console
-	clusterQuotaInfo, err := getClusterQuotaInfo(ctx, deployment, r.Client)
+	// Gọi hàm để lấy thông tin PropagationPolicy tương ứng
+	propagationPolicy, err := r.getPropagationPolicyForDeployment(ctx, deployment)
 	if err != nil {
-		log.Error(err, "unable to get cluster quota info")
+		log.Error(err, "unable to fetch PropagationPolicy")
 		return ctrl.Result{}, err
 	}
-	fmt.Printf("Cluster Quota Info: %s\n", clusterQuotaInfo)
 
-	log.Info("Starting quota adjustment")
-	err = adjustQuotaBasedOnDeployment(ctx, deployment, r.Client)
-	if err != nil {
-		log.Error(err, "Failed to adjust quota")
+	// Lấy danh sách các cluster từ PropagationPolicy
+	if propagationPolicy != nil {
+		clusterNames := propagationPolicy.Spec.Placement.ClusterAffinity.ClusterNames
+		fmt.Printf("Cluster Names: %v\n", clusterNames)
+
+		// Gọi hàm để lấy thông tin Resource Quota của các cluster
+		clusterQuotaInfoJson, err := getClusterQuotaInfo(ctx, deployment, clusterNames, r.Client)
+		if err != nil {
+			log.Error(err, "unable to fetch cluster quota info")
+			return ctrl.Result{}, err
+		}
+		fmt.Printf("Cluster Quota Info: %s\n", clusterQuotaInfoJson)
+
+		// Giải mã JSON thành map[string]interface{}
+		var clusterQuotaInfo map[string]interface{}
+		if err := json.Unmarshal([]byte(clusterQuotaInfoJson), &clusterQuotaInfo); err != nil {
+			log.Error(err, "unable to unmarshal cluster quota info")
+			return ctrl.Result{}, err
+		}
+
+		// Gọi hàm adjustResourceQuota để điều chỉnh resource quota cho các cluster
+		err = adjustResourceQuota(ctx, deployment, clusterQuotaInfo, r.Client)
+		if err != nil {
+			log.Error(err, "unable to adjust resource quota")
+			return ctrl.Result{}, err
+		}
+	} else {
+		fmt.Println("No matching PropagationPolicy found")
 	}
-	log.Info("Finished quota adjustment")
 
 	return ctrl.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *DeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// return ctrl.NewControllerManagedBy(mgr).
-	// 	// Uncomment the following line adding a pointer to an instance of the controlled resource as an argument
-	// 	// For().
-	// 	Complete(r)
-
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1.Deployment{}). // Chỉ định controller theo dõi Deployment
 		Complete(r)
@@ -137,8 +145,32 @@ func getDeploymentInfo(deployment appsv1.Deployment) (string, error) {
 	return string(jsonResult), nil
 }
 
-// getClusterQuotaInfo trả về thông tin Resource Quota của từng cluster dưới dạng JSON
-func getClusterQuotaInfo(ctx context.Context, deployment appsv1.Deployment, c client.Client) (string, error) {
+// getPropagationPolicyForDeployment tìm PropagationPolicy tương ứng với Deployment
+func (r *DeploymentReconciler) getPropagationPolicyForDeployment(ctx context.Context, deployment appsv1.Deployment) (*karmadapolicyv1alpha1.PropagationPolicy, error) {
+	// Tạo danh sách PropagationPolicy để tìm kiếm
+	var propagationPolicyList karmadapolicyv1alpha1.PropagationPolicyList
+
+	// Lấy danh sách tất cả các PropagationPolicy trong cùng namespace với Deployment
+	if err := r.List(ctx, &propagationPolicyList, &client.ListOptions{Namespace: deployment.Namespace}); err != nil {
+		return nil, err
+	}
+
+	// Tìm PropagationPolicy có resourceSelector khớp với Deployment
+	for _, policy := range propagationPolicyList.Items {
+		for _, selector := range policy.Spec.ResourceSelectors {
+			if selector.Kind == "Deployment" && selector.Name == deployment.Name {
+				// Trả về PropagationPolicy tìm được
+				return &policy, nil
+			}
+		}
+	}
+
+	// Nếu không tìm thấy, trả về nil
+	return nil, nil
+}
+
+// getClusterQuotaInfo trả về thông tin Resource Quota của từng cluster trong danh sách clusterNames dưới dạng JSON
+func getClusterQuotaInfo(ctx context.Context, deployment appsv1.Deployment, clusterNames []string, c client.Client) (string, error) {
 	log := log.FromContext(ctx)
 
 	// Lấy thông tin về FederatedResourceQuota dựa trên namespace của Deployment
@@ -157,19 +189,22 @@ func getClusterQuotaInfo(ctx context.Context, deployment appsv1.Deployment, c cl
 	for _, frq := range federatedResourceQuotaList.Items {
 		// Thêm các thông tin aggregatedStatus
 		for _, status := range frq.Status.AggregatedStatus {
-			hardCpu := status.Hard["cpu"]
-			usedCpu := status.Used["cpu"]
-			hardMemory := status.Hard["memory"]
-			usedMemory := status.Used["memory"]
+			// Chỉ lấy thông tin resource quota cho các cluster nằm trong danh sách clusterNames
+			if contains(clusterNames, status.ClusterName) {
+				hardCpu := status.Hard["cpu"]
+				usedCpu := status.Used["cpu"]
+				hardMemory := status.Hard["memory"]
+				usedMemory := status.Used["memory"]
 
-			// Thêm thông tin cluster vào kết quả
-			result["clusterStatus"] = append(result["clusterStatus"].([]map[string]string), map[string]string{
-				"Cluster Name": status.ClusterName,
-				"Hard CPU":     hardCpu.String(),
-				"Used CPU":     usedCpu.String(),
-				"Hard Memory":  hardMemory.String(),
-				"Used Memory":  usedMemory.String(),
-			})
+				// Thêm thông tin cluster vào kết quả
+				result["clusterStatus"] = append(result["clusterStatus"].([]map[string]string), map[string]string{
+					"Cluster Name": status.ClusterName,
+					"Hard CPU":     hardCpu.String(),
+					"Used CPU":     usedCpu.String(),
+					"Hard Memory":  hardMemory.String(),
+					"Used Memory":  usedMemory.String(),
+				})
+			}
 		}
 	}
 
@@ -183,87 +218,106 @@ func getClusterQuotaInfo(ctx context.Context, deployment appsv1.Deployment, c cl
 	return string(jsonResult), nil
 }
 
-// adjustQuotaBasedOnDeployment điều chỉnh FederatedResourceQuota dựa trên yêu cầu tài nguyên của Deployment
-func adjustQuotaBasedOnDeployment(ctx context.Context, deployment appsv1.Deployment, c client.Client) error {
+// contains kiểm tra xem một chuỗi có nằm trong slice hay không
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+// adjustResourceQuota điều chỉnh resource quota cho các cluster để đáp ứng resource requirement của deployment
+func adjustResourceQuota(ctx context.Context, deployment appsv1.Deployment, clusterQuotaInfo map[string]interface{}, c client.Client) error {
 	log := log.FromContext(ctx)
 
-	// Lấy danh sách FederatedResourceQuota trong namespace của Deployment
-	var federatedResourceQuotaList karmadapolicyv1alpha1.FederatedResourceQuotaList
-	if err := c.List(ctx, &federatedResourceQuotaList, client.InNamespace(deployment.Namespace)); err != nil {
-		log.Error(err, "unable to list FederatedResourceQuotas")
-		return err
+	// Lấy yêu cầu về CPU và Memory của Deployment
+	container := deployment.Spec.Template.Spec.Containers[0]
+	requiredCPU := container.Resources.Requests.Cpu()
+	requiredMemory := container.Resources.Requests.Memory()
+
+	// Duyệt qua từng cluster trong clusterQuotaInfo và kiểm tra điều chỉnh quota nếu cần
+	clusterStatus, ok := clusterQuotaInfo["clusterStatus"].([]interface{})
+	if !ok {
+		return fmt.Errorf("unexpected data format for clusterStatus")
 	}
 
-	// Lấy yêu cầu CPU và Memory từ Deployment
-	container := deployment.Spec.Template.Spec.Containers[0]
-	cpuRequest := container.Resources.Requests[corev1.ResourceCPU]
-	memoryRequest := container.Resources.Requests[corev1.ResourceMemory]
+	for _, clusterStatusItem := range clusterStatus {
+		clusterMap, ok := clusterStatusItem.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("unexpected data format in cluster status item")
+		}
 
-	for _, frq := range federatedResourceQuotaList.Items {
-		quotaUpdated := false // Cờ để kiểm tra xem quota có được cập nhật hay không
+		clusterName := clusterMap["Cluster Name"].(string)
+		hardCPU := resource.MustParse(clusterMap["Hard CPU"].(string))
+		usedCPU := resource.MustParse(clusterMap["Used CPU"].(string))
+		hardMemory := resource.MustParse(clusterMap["Hard Memory"].(string))
+		usedMemory := resource.MustParse(clusterMap["Used Memory"].(string))
 
-		// Duyệt qua từng cluster trong staticAssignments của FederatedResourceQuota
-		for i, assignment := range frq.Spec.StaticAssignments {
-			hardCpu := assignment.Hard[corev1.ResourceCPU]
-			hardMemory := assignment.Hard[corev1.ResourceMemory]
+		// Tính toán tài nguyên còn lại (hard - used)
+		availableCPU := hardCPU.DeepCopy()
+		availableCPU.Sub(usedCPU)
 
-			// Tìm thông tin tài nguyên đã sử dụng từ AggregatedStatus
-			var usedCpu, usedMemory resource.Quantity
-			for _, status := range frq.Status.AggregatedStatus {
-				if status.ClusterName == assignment.ClusterName {
-					usedCpu = status.Used[corev1.ResourceCPU]
-					usedMemory = status.Used[corev1.ResourceMemory]
+		availableMemory := hardMemory.DeepCopy()
+		availableMemory.Sub(usedMemory)
+
+		// Kiểm tra nếu tài nguyên còn lại không đủ đáp ứng resource requirement
+		if availableCPU.Cmp(*requiredCPU) < 0 || availableMemory.Cmp(*requiredMemory) < 0 {
+			// Kiểm tra xem resource quota đã được cập nhật chưa, nếu cập nhật đủ rồi thì không cần điều chỉnh
+			if hardCPU.Cmp(*requiredCPU) >= 0 && hardMemory.Cmp(*requiredMemory) >= 0 {
+				fmt.Printf("Resource quota for cluster %s is already sufficient, no update needed.\n", clusterName)
+				continue
+			}
+
+			// Tính toán lượng tài nguyên cần bổ sung
+			cpuToAdd := requiredCPU.DeepCopy()
+			cpuToAdd.Sub(availableCPU) // Chỉ thêm phần thiếu
+
+			memoryToAdd := requiredMemory.DeepCopy()
+			memoryToAdd.Sub(availableMemory) // Chỉ thêm phần thiếu
+
+			// Tạo đối tượng FederatedResourceQuota để điều chỉnh
+			var frq karmadapolicyv1alpha1.FederatedResourceQuota
+			if err := c.Get(ctx, client.ObjectKey{Namespace: deployment.Namespace, Name: deployment.Namespace}, &frq); err != nil {
+				log.Error(err, "unable to fetch FederatedResourceQuota")
+				return err
+			}
+
+			// Tìm staticAssignments tương ứng với clusterName
+			for i, assignment := range frq.Spec.StaticAssignments {
+				if assignment.ClusterName == clusterName {
+					// Điều chỉnh CPU và Memory trong quota cho cluster đó
+					newHardCPU := hardCPU.DeepCopy()
+					newHardCPU.Add(cpuToAdd) // Thêm phần thiếu hụt
+
+					newHardMemory := hardMemory.DeepCopy()
+					newHardMemory.Add(memoryToAdd) // Thêm phần thiếu hụt
+
+					frq.Spec.StaticAssignments[i].Hard["cpu"] = newHardCPU
+					frq.Spec.StaticAssignments[i].Hard["memory"] = newHardMemory
+
+					// Cập nhật FederatedResourceQuota
+					if err := c.Update(ctx, &frq); err != nil {
+						log.Error(err, "unable to update FederatedResourceQuota")
+						return err
+					}
+
+					fmt.Printf("Adjusted resource quota for cluster %s: new CPU = %s, new Memory = %s\n", clusterName, newHardCPU.String(), newHardMemory.String())
+
+					// Tạm dừng một khoảng thời gian ngắn để hệ thống đồng bộ lại trạng thái
+					time.Sleep(5 * time.Second)
+
+					// Lấy lại thông tin mới từ API sau khi cập nhật (không cần truyền ListOptions)
+					if err := c.Get(ctx, client.ObjectKey{Namespace: deployment.Namespace, Name: deployment.Namespace}, &frq); err != nil {
+						log.Error(err, "unable to fetch updated FederatedResourceQuota directly from API server")
+						return err
+					}
 					break
 				}
 			}
-
-			// Tính toán tài nguyên khả dụng
-			availableCpu := hardCpu.DeepCopy()
-			availableCpu.Sub(usedCpu)
-			availableMemory := hardMemory.DeepCopy()
-			availableMemory.Sub(usedMemory)
-
-			// Điều chỉnh quota CPU nếu không đủ
-			// Điều chỉnh quota CPU nếu không đủ
-			if cpuRequest.Cmp(availableCpu) > 0 {
-				// Tính toán phần thiếu CPU
-				cpuDeficit := cpuRequest.DeepCopy()
-				cpuDeficit.Sub(availableCpu)
-
-				// Tăng hard resource để bù vào phần thiếu
-				newCpuLimit := hardCpu.DeepCopy()
-				newCpuLimit.Add(cpuDeficit)
-
-				frq.Spec.StaticAssignments[i].Hard[corev1.ResourceCPU] = newCpuLimit
-
-				log.Info("Adjusted CPU FederatedResourceQuota for cluster", "cluster", assignment.ClusterName, "new CPU limit", newCpuLimit.String(), "CPU deficit", cpuDeficit.String())
-				quotaUpdated = true
-			}
-
-			// Điều chỉnh quota Memory nếu không đủ
-			if memoryRequest.Cmp(availableMemory) > 0 {
-				// Tính toán phần thiếu Memory
-				memoryDeficit := memoryRequest.DeepCopy()
-				memoryDeficit.Sub(availableMemory)
-
-				// Tăng hard resource để bù vào phần thiếu
-				newMemoryLimit := hardMemory.DeepCopy()
-				newMemoryLimit.Add(memoryDeficit)
-
-				frq.Spec.StaticAssignments[i].Hard[corev1.ResourceMemory] = newMemoryLimit
-
-				log.Info("Adjusted Memory FederatedResourceQuota for cluster", "cluster", assignment.ClusterName, "new Memory limit", newMemoryLimit.String(), "Memory deficit", memoryDeficit.String())
-				quotaUpdated = true
-			}
-		}
-
-		// Nếu quota đã được điều chỉnh, cập nhật lại FederatedResourceQuota
-		if quotaUpdated {
-			if err := c.Update(ctx, &frq); err != nil {
-				log.Error(err, "unable to update FederatedResourceQuota", "namespace", frq.Namespace, "name", frq.Name)
-				return err
-			}
-			log.Info("Successfully updated FederatedResourceQuota", "name", frq.Name, "namespace", frq.Namespace)
+		} else {
+			fmt.Printf("No adjustment needed for cluster %s: available CPU and Memory are sufficient.\n", clusterName)
 		}
 	}
 

@@ -5,7 +5,7 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - resourcequotascaling.trhthang.com
+  - apps
   resources:
   - deployments
   verbs:
@@ -17,16 +17,10 @@ rules:
   - update
   - watch
 - apiGroups:
-  - resourcequotascaling.trhthang.com
+  - policy.karmada.io
   resources:
-  - deployments/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - resourcequotascaling.trhthang.com
-  resources:
-  - deployments/status
+  - propagationpolicies
   verbs:
   - get
-  - patch
-  - update
+  - list
+  - watch
